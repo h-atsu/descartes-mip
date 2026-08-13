@@ -1,0 +1,36 @@
+[project]
+name = "descartes-mip"
+version = "0.1.0"
+description = "Automatic Lagrangian decomposition for PuLP models"
+readme = "README.md"
+authors = [
+    { name = "h-atsu", email = "jhuim08@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "highspy>=1.15.1",
+    "pulp>=3.3.2",
+]
+
+[project.scripts]
+descartes-mip = "descartes_mip:main"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[build-system]
+requires = ["uv_build>=0.11.19,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+    "pytest>=9.1.1",
+    "ruff>=0.16.2",
+    "ty>=0.0.71",
+]
