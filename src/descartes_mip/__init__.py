@@ -14,12 +14,17 @@ from descartes_mip.exceptions import (
     ModelValidationError,
     SubproblemSolveError,
 )
+from descartes_mip.result import IterationRecord, LagrangianResult, SubproblemRecord
+from descartes_mip.solver import IterationCallback, solve
 from descartes_mip.solvers import highs_factory
 from descartes_mip.types import SolverFactory
 
 __all__ = [
     "Decomposition",
     "DescartesMipError",
+    "IterationCallback",
+    "IterationRecord",
+    "LagrangianResult",
     "LinearTerm",
     "ModelValidationError",
     "RelaxedConstraint",
@@ -27,9 +32,11 @@ __all__ = [
     "SoftConstraint",
     "SolverFactory",
     "Subproblem",
+    "SubproblemRecord",
     "SubproblemSolveError",
     "decompose",
     "highs_factory",
+    "solve",
 ]
 
 

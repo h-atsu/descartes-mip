@@ -32,7 +32,28 @@ for subproblem in decomposition.subproblems:
 ```
 
 `Decomposition` は診断用の不変データで、変数、ハード制約、目的係数、緩和制約の
-部分式を確認できます。現時点では構造解析のみで、反復求解APIはMilestone 3で追加します。
+部分式を確認できます。
+
+分解した部分問題をHiGHSで逐次求解し、投影付きPolyak劣勾配法で乗数を更新できます。
+
+```python
+from descartes_mip import solve
+
+result = solve(
+    problem,
+    relax=[SoftConstraint(coupling, penalty=100.0)],
+    max_iterations=100,
+)
+
+print(result.best_primal_bound)
+print(result.best_dual_bound)
+print(result.variable_values)
+```
+
+最小化では `best_primal_bound` がソフト問題の実行可能上界、
+`best_dual_bound` がcertified下界です。最大化ではそれぞれ実行可能下界とcertified上界に
+なります。各部分問題が最適性を証明できない場合、その時点で
+`SubproblemSolveError` を送出します。
 
 ## 開発環境
 
@@ -50,6 +71,6 @@ uv run pytest
 
 - [x] Milestone 1: プロジェクト基盤と設計文書
 - [x] Milestone 2: PuLPモデルの解析と自動分解
-- [ ] Milestone 3: ラグランジュ反復求解
+- [x] Milestone 3: ラグランジュ反復求解
 - [ ] Milestone 4: 時間制御・結果・障害処理
 - [ ] Milestone 5: 並列求解と公開品質

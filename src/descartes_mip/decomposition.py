@@ -181,16 +181,7 @@ def _read_model(problem: pulp.LpProblem) -> ModelIR:
     if len(set(names)) != len(names):
         raise ModelValidationError("variable names must be unique")
 
-    variables = tuple(
-        VariableIR(
-            name=variable.name,
-            low_bound=variable.lowBound,
-            up_bound=variable.upBound,
-            category=variable.cat,
-            source=variable,
-        )
-        for variable in source_variables
-    )
+    variables = tuple(_read_variable(variable) for variable in source_variables)
     variable_index_by_identity = {
         id(variable): index for index, variable in enumerate(source_variables)
     }
@@ -237,6 +228,20 @@ def _read_terms(items, variable_indexes: dict[int, int], owner: str) -> tuple[Li
             raise ModelValidationError(f"{owner} references an unregistered variable") from error
         terms.append(LinearTermIR(variable_index, _finite(coefficient, owner)))
     return tuple(sorted(terms, key=lambda term: term.variable_index))
+
+
+def _read_variable(variable: pulp.LpVariable) -> VariableIR:
+    low_bound = _finite_bound(variable.lowBound, variable.name, "lower")
+    up_bound = _finite_bound(variable.upBound, variable.name, "upper")
+    if low_bound is not None and up_bound is not None and low_bound > up_bound:
+        raise ModelValidationError(f"variable {variable.name!r} has inconsistent bounds")
+    return VariableIR(
+        name=variable.name,
+        low_bound=low_bound,
+        up_bound=up_bound,
+        category=variable.cat,
+        source=variable,
+    )
 
 
 def _validate_soft_constraints(
@@ -363,3 +368,14 @@ def _finite(value: float, owner: str) -> float:
     if not math.isfinite(result):
         raise ModelValidationError(f"{owner} contains a non-finite value")
     return result
+
+
+def _finite_bound(value: float | None, variable_name: str, side: str) -> float | None:
+    if value is None:
+        return None
+    try:
+        return _finite(value, f"{side} bound of variable {variable_name!r}")
+    except (TypeError, ValueError) as error:
+        raise ModelValidationError(
+            f"{side} bound of variable {variable_name!r} must be finite"
+        ) from error

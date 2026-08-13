@@ -1,7 +1,10 @@
 # %%
 import pulp
 
-from descartes_mip.decomposition import SoftConstraint, decompose
+from descartes_mip import (
+    SoftConstraint,
+    solve,
+)
 
 # %%
 problem = pulp.LpProblem("two_components", pulp.LpMinimize)
@@ -19,8 +22,7 @@ problem += coupling, "coupling"
 
 
 # %%
-
-decomposition = decompose(
+result = solve(
     problem,
     relax=[
         SoftConstraint(coupling, penalty=20),
@@ -30,8 +32,8 @@ decomposition = decompose(
 
 
 # %%
-for subproblem in decomposition.subproblems:
-    print(subproblem)
+print(result)
+
 # %%
 status = problem.solve()
 # %%
