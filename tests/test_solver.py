@@ -210,11 +210,12 @@ def test_solve_rejects_initial_multiplier_outside_box() -> None:
 
 
 def test_solve_rejects_nonoptimal_subproblem() -> None:
-    problem = pulp.LpProblem("unbounded", pulp.LpMinimize)
-    x = problem.add_variable("x")
-    problem += -x
+    problem = pulp.LpProblem("infeasible", pulp.LpMinimize)
+    x = problem.add_variable("x", lowBound=0, upBound=1)
+    problem += x
+    problem += x >= 2, "impossible"
 
-    with pytest.raises(SubproblemSolveError, match="subproblem 0.*Unbounded"):
+    with pytest.raises(SubproblemSolveError, match="subproblem 0.*Infeasible"):
         solve(problem, relax=[], max_iterations=1)
 
 
@@ -296,8 +297,8 @@ def test_solve_reconstructs_and_enforces_local_hard_constraints() -> None:
     x = problem.add_variable("x", lowBound=0)
     y = problem.add_variable("y", lowBound=0)
     problem += x + y
-    problem += x >= 2, "x_minimum"
-    problem += y >= 3, "y_minimum"
+    problem += x == 2, "x_value"
+    problem += y == 3, "y_value"
     coupling = x + y <= 4
     problem += coupling, "coupling"
 
@@ -312,6 +313,78 @@ def test_solve_reconstructs_and_enforces_local_hard_constraints() -> None:
     assert result.slacks == {"coupling": 1.0}
     assert result.best_primal_bound == pytest.approx(15)
     assert not result.hard_feasible
+
+
+def test_solve_rejects_a_recession_ray_created_by_relaxation() -> None:
+    problem = pulp.LpProblem("relaxation_creates_ray", pulp.LpMinimize)
+    x = problem.add_variable("x", lowBound=0)
+    y = problem.add_variable("y", lowBound=0, upBound=8)
+    problem += 3 * x + 4 * y
+    coupling = x + 2 * y >= 6
+    capacity = x <= 10
+    problem += coupling, "coupling"
+    problem += capacity, "capacity"
+
+    with pytest.raises(
+        ModelValidationError,
+        match=r"subproblem 0.*recession direction: x=1",
+    ):
+        solve(
+            problem,
+            relax=[
+                SoftConstraint(coupling, penalty=20),
+                SoftConstraint(capacity, penalty=20),
+            ],
+            max_iterations=1,
+        )
+
+
+def test_recession_check_detects_a_multi_coordinate_direction() -> None:
+    problem = pulp.LpProblem("coupled_ray", pulp.LpMinimize)
+    x = problem.add_variable("x", lowBound=0)
+    y = problem.add_variable("y", lowBound=0)
+    problem += x + y
+    problem += x == y, "move_together"
+
+    with pytest.raises(ModelValidationError) as error:
+        solve(problem, relax=[], max_iterations=1)
+
+    assert "x=1" in str(error.value)
+    assert "y=1" in str(error.value)
+
+
+def test_recession_check_accepts_implicit_bounds_from_hard_constraints() -> None:
+    problem = pulp.LpProblem("implicitly_bounded", pulp.LpMinimize)
+    x = problem.add_variable("x", lowBound=0)
+    y = problem.add_variable("y", lowBound=0)
+    problem += x + y
+    problem += x + y <= 10, "shared_upper_bound"
+
+    result = solve(problem, relax=[], max_iterations=1)
+
+    assert result.variable_values == {"x": 0.0, "y": 0.0}
+
+
+def test_explicit_bounds_skip_recession_solver() -> None:
+    problem, coupling = build_binary_pair(
+        sense=pulp.LpMinimize,
+        objective=(1, 2),
+        constraint_sense=">=",
+    )
+    calls: list[float | None] = []
+
+    def factory(remaining_time: float | None) -> pulp.LpSolver:
+        calls.append(remaining_time)
+        return highs_factory(remaining_time)
+
+    solve(
+        problem,
+        relax=[SoftConstraint(coupling, penalty=3)],
+        solver_factory=factory,
+        max_iterations=1,
+    )
+
+    assert calls == [None, None]
 
 
 def test_solve_preserves_original_model_solution_state() -> None:

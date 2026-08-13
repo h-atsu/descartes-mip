@@ -53,6 +53,11 @@ def solve(
     relaxed = _relaxed_model_constraints(model, decomposition)
     multipliers = _initial_multipliers(decomposition, initial_multipliers)
     built_subproblems = _build_subproblems(decomposition, relaxed)
+    _validate_subproblems_bounded(
+        decomposition,
+        built_subproblems,
+        solver_factory,
+    )
 
     best_primal_normalized = math.inf
     best_dual_normalized = -math.inf
@@ -252,6 +257,147 @@ def _build_subproblems(
             )
         )
     return tuple(built)
+
+
+def _validate_subproblems_bounded(
+    decomposition: Decomposition,
+    subproblems: tuple[_BuiltSubproblem, ...],
+    solver_factory: SolverFactory,
+) -> None:
+    """Require every hard feasible region to have a trivial recession cone."""
+    model = decomposition._model
+    diagnostic_by_id = {subproblem.id: subproblem for subproblem in decomposition.subproblems}
+    constraint_by_name = {constraint.name: constraint for constraint in model.constraints}
+
+    for subproblem in subproblems:
+        variable_indexes = tuple(subproblem.variables)
+        if all(
+            model.variables[index].low_bound is not None
+            and model.variables[index].up_bound is not None
+            for index in variable_indexes
+        ):
+            continue
+        diagnostic = diagnostic_by_id[subproblem.id]
+        hard_constraints = tuple(constraint_by_name[name] for name in diagnostic.hard_constraints)
+        ray = _find_recession_ray(
+            subproblem.id,
+            variable_indexes,
+            hard_constraints,
+            model,
+            solver_factory,
+        )
+        if ray is not None:
+            formatted_ray = ", ".join(f"{name}={value:.6g}" for name, value in ray.items())
+            raise ModelValidationError(
+                f"subproblem {subproblem.id} is not bounded after relaxation; "
+                f"recession direction: {formatted_ray}. Add valid variable bounds "
+                "or relax a different set of constraints"
+            )
+
+
+def _find_recession_ray(
+    subproblem_id: int,
+    variable_indexes: tuple[int, ...],
+    hard_constraints: tuple[ConstraintIR, ...],
+    model: ModelIR,
+    solver_factory: SolverFactory,
+) -> dict[str, float] | None:
+    """Return a normalized nonzero recession direction, if one exists."""
+    ray_problem = pulp.LpProblem(
+        f"{model.name}_subproblem_{subproblem_id}_recession",
+        pulp.LpMinimize,
+    )
+    directions = {
+        index: ray_problem.add_variable(
+            f"direction_{model.variables[index].name}",
+            lowBound=-1,
+            upBound=1,
+        )
+        for index in variable_indexes
+    }
+    positive_selectors = {
+        index: ray_problem.add_variable(
+            f"positive_{model.variables[index].name}",
+            lowBound=0,
+            upBound=1,
+            cat=pulp.LpBinary,
+        )
+        for index in variable_indexes
+    }
+    negative_selectors = {
+        index: ray_problem.add_variable(
+            f"negative_{model.variables[index].name}",
+            lowBound=0,
+            upBound=1,
+            cat=pulp.LpBinary,
+        )
+        for index in variable_indexes
+    }
+
+    ray_problem += 0
+    for index, direction in directions.items():
+        variable = model.variables[index]
+        if variable.low_bound is not None:
+            ray_problem += direction >= 0, f"lower_bound_direction_{index}"
+        if variable.up_bound is not None:
+            ray_problem += direction <= 0, f"upper_bound_direction_{index}"
+
+        # With -1 <= direction <= 1, these implications force a selected
+        # coordinate to +1 or -1 while leaving unselected coordinates free.
+        ray_problem += (
+            direction >= 2 * positive_selectors[index] - 1,
+            f"select_positive_direction_{index}",
+        )
+        ray_problem += (
+            direction <= 1 - 2 * negative_selectors[index],
+            f"select_negative_direction_{index}",
+        )
+
+    ray_problem += (
+        pulp.lpSum(positive_selectors.values()) + pulp.lpSum(negative_selectors.values()) == 1,
+        "select_nonzero_direction",
+    )
+    for constraint_index, constraint in enumerate(hard_constraints):
+        expression = pulp.lpSum(
+            term.coefficient * directions[term.variable_index] for term in constraint.terms
+        )
+        ray_problem += (
+            pulp.LpConstraint(
+                e=expression,
+                sense=constraint.sense,
+                rhs=0,
+            ),
+            f"hard_direction_{constraint_index}_{constraint.name}",
+        )
+
+    try:
+        status = ray_problem.solve(solver_factory(None))
+    except Exception as error:
+        raise SubproblemSolveError(
+            f"recession check for subproblem {subproblem_id} raised {type(error).__name__}: {error}"
+        ) from error
+    if status == pulp.LpStatusInfeasible:
+        return None
+    status_name = pulp.LpStatus.get(status, f"Unknown({status})")
+    if status != pulp.LpStatusOptimal:
+        raise SubproblemSolveError(
+            f"recession check for subproblem {subproblem_id} did not finish: {status_name}"
+        )
+
+    result: dict[str, float] = {}
+    for index, direction in directions.items():
+        value = direction.value()
+        if value is None or not math.isfinite(value):
+            raise SubproblemSolveError(
+                f"recession check for subproblem {subproblem_id} returned no finite direction"
+            )
+        if abs(value) > 1e-7:
+            result[model.variables[index].name] = float(value)
+    if not result:
+        raise SubproblemSolveError(
+            f"recession check for subproblem {subproblem_id} returned a zero direction"
+        )
+    return result
 
 
 def _solve_subproblems(
