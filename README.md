@@ -7,6 +7,12 @@
 [APIリファレンス](docs/api.md)を参照してください。実行可能な一連の例は
 [チュートリアル](examples/tutorial.py)にあります。
 
+## インストール
+
+```bash
+pip install descartes-mip
+```
+
 ## 現在利用できるAPI
 
 PuLPモデルから、指定した制約を除いた変数–制約グラフの連結成分を抽出できます。

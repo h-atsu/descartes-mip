@@ -3,14 +3,37 @@ name = "descartes-mip"
 version = "0.1.0"
 description = "Automatic Lagrangian decomposition for PuLP models"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "h-atsu", email = "jhuim08@gmail.com" }
 ]
 requires-python = ">=3.12"
+keywords = [
+    "lagrangian-relaxation",
+    "mathematical-optimization",
+    "milp",
+    "operations-research",
+    "pulp",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Typing :: Typed",
+]
 dependencies = [
     "highspy>=1.15.1",
     "pulp>=3.3.2",
 ]
+
+[project.urls]
+Documentation = "https://github.com/h-atsu/descartes-mip/blob/main/docs/api.md"
+Issues = "https://github.com/h-atsu/descartes-mip/issues"
+Repository = "https://github.com/h-atsu/descartes-mip"
 
 [project.scripts]
 descartes-mip = "descartes_mip:main"
