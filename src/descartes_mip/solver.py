@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
@@ -30,12 +31,20 @@ class _BuiltSubproblem:
     objective_coefficients: dict[int, float]
 
 
+class _TimeLimitReached(Exception):
+    """Signal that an incomplete iteration must be discarded."""
+
+    def __init__(self, subproblem_id: int | None) -> None:
+        self.subproblem_id = subproblem_id
+
+
 def solve(
     problem: pulp.LpProblem,
     *,
     relax: Sequence[SoftConstraint],
     solver_factory: SolverFactory = highs_factory,
     max_iterations: int = 100,
+    time_limit: float | None = None,
     polyak_factor: float = 1.0,
     initial_multipliers: Mapping[str, float] | None = None,
     callback: IterationCallback | None = None,
@@ -46,7 +55,9 @@ def solve(
     are reported in the original objective sense: a primal upper and dual lower
     bound for minimization, and a primal lower and dual upper bound for maximization.
     """
-    _validate_options(max_iterations, polyak_factor, solver_factory)
+    _validate_options(max_iterations, time_limit, polyak_factor, solver_factory)
+    started_at = time.monotonic()
+    deadline = None if time_limit is None else started_at + time_limit
     soft_constraints = tuple(relax)
     decomposition = decompose(problem, relax=soft_constraints)
     _validate_explicit_variable_bounds(decomposition)
@@ -61,15 +72,25 @@ def solve(
     best_slacks: dict[str, float] = {}
     history: list[IterationRecord] = []
     termination_reason = "max_iterations"
+    timed_out_subproblem: int | None = None
 
     for iteration in range(max_iterations):
-        values, subproblem_records, variable_objective = _solve_subproblems(
-            built_subproblems,
-            model,
-            relaxed,
-            multipliers,
-            solver_factory,
-        )
+        if _deadline_reached(deadline):
+            termination_reason = "time_limit"
+            break
+        try:
+            values, subproblem_records, variable_objective = _solve_subproblems(
+                built_subproblems,
+                model,
+                relaxed,
+                multipliers,
+                solver_factory,
+                deadline,
+            )
+        except _TimeLimitReached as timeout:
+            termination_reason = "time_limit"
+            timed_out_subproblem = timeout.subproblem_id
+            break
         residuals = {
             constraint.name: _normalized_constraint_value(model, constraint, values)
             for constraint in relaxed
@@ -119,14 +140,19 @@ def solve(
             violations=violations,
             variable_values=values,
             subproblems=subproblem_records,
+            elapsed_time=max(0.0, time.monotonic() - started_at),
         )
         history.append(record)
         multipliers = next_multipliers
         if callback is not None and callback(record):
             termination_reason = "callback"
             break
+        if _deadline_reached(deadline):
+            termination_reason = "time_limit"
+            break
 
     relative_gap = _relative_gap(best_primal_normalized, best_dual_normalized)
+    has_completed_iteration = bool(history)
     return LagrangianResult(
         termination_reason=termination_reason,
         iterations=len(history),
@@ -136,16 +162,21 @@ def solve(
         relative_gap=relative_gap,
         variable_values=best_values,
         slacks=best_slacks,
-        hard_feasible=all(value <= 1e-7 for value in best_slacks.values()),
-        soft_feasible=True,
+        hard_feasible=has_completed_iteration
+        and all(value <= 1e-7 for value in best_slacks.values()),
+        soft_feasible=has_completed_iteration,
+        has_certified_bounds=has_completed_iteration,
         multipliers=dict(multipliers),
         history=tuple(history),
         decomposition=decomposition,
+        elapsed_time=max(0.0, time.monotonic() - started_at),
+        timed_out_subproblem=timed_out_subproblem,
     )
 
 
 def _validate_options(
     max_iterations: int,
+    time_limit: float | None,
     polyak_factor: float,
     solver_factory: SolverFactory,
 ) -> None:
@@ -153,6 +184,13 @@ def _validate_options(
         raise ModelValidationError("max_iterations must be a positive integer")
     if max_iterations <= 0:
         raise ModelValidationError("max_iterations must be a positive integer")
+    if time_limit is not None and (
+        isinstance(time_limit, bool)
+        or not isinstance(time_limit, (int, float))
+        or not math.isfinite(time_limit)
+        or time_limit <= 0
+    ):
+        raise ModelValidationError("time_limit must be a positive finite number or None")
     if isinstance(polyak_factor, bool) or not isinstance(polyak_factor, (int, float)):
         raise ModelValidationError("polyak_factor must be finite and in (0, 2]")
     if not math.isfinite(polyak_factor) or not 0 < polyak_factor <= 2:
@@ -279,11 +317,15 @@ def _solve_subproblems(
     relaxed: tuple[ConstraintIR, ...],
     multipliers: Mapping[str, float],
     solver_factory: SolverFactory,
+    deadline: float | None,
 ) -> tuple[dict[str, float], tuple[SubproblemRecord, ...], float]:
     values: dict[str, float] = {}
     records: list[SubproblemRecord] = []
     total_objective = 0.0
     for subproblem in subproblems:
+        remaining_time = _remaining_time(deadline)
+        if remaining_time is not None and remaining_time <= 0:
+            raise _TimeLimitReached(subproblem.id)
         coefficients = dict(subproblem.objective_coefficients)
         for constraint in relaxed:
             multiplier = multipliers[constraint.name]
@@ -295,21 +337,43 @@ def _solve_subproblems(
             coefficients[index] * variable for index, variable in subproblem.variables.items()
         )
         subproblem.problem.setObjective(objective)
+        subproblem_started_at = time.monotonic()
         try:
-            solver = solver_factory(None)
+            solver = solver_factory(remaining_time)
             status = subproblem.problem.solve(solver)
+        except TimeoutError as error:
+            if deadline is not None:
+                raise _TimeLimitReached(subproblem.id) from error
+            raise SubproblemSolveError(
+                f"subproblem {subproblem.id} solver raised TimeoutError: {error}"
+            ) from error
         except Exception as error:
             raise SubproblemSolveError(
                 f"subproblem {subproblem.id} solver raised {type(error).__name__}: {error}"
             ) from error
         status_name = pulp.LpStatus.get(status, f"Unknown({status})")
         if status != pulp.LpStatusOptimal:
+            if status in (pulp.LpStatusInfeasible, pulp.LpStatusUnbounded):
+                raise SubproblemSolveError(
+                    f"subproblem {subproblem.id} did not reach optimality: {status_name}"
+                )
+            if deadline is not None and (
+                status == pulp.LpStatusNotSolved or _deadline_reached(deadline)
+            ):
+                raise _TimeLimitReached(subproblem.id)
             raise SubproblemSolveError(
                 f"subproblem {subproblem.id} did not reach optimality: {status_name}"
             )
         objective_value = float(pulp.value(subproblem.problem.objective) or 0.0)
         total_objective += objective_value
-        records.append(SubproblemRecord(subproblem.id, status_name, objective_value))
+        records.append(
+            SubproblemRecord(
+                subproblem.id,
+                status_name,
+                objective_value,
+                max(0.0, time.monotonic() - subproblem_started_at),
+            )
+        )
         for index, variable in subproblem.variables.items():
             value = variable.value()
             if value is None:
@@ -320,6 +384,16 @@ def _solve_subproblems(
                 )
             values[model.variables[index].name] = float(value)
     return values, tuple(records), total_objective
+
+
+def _remaining_time(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def _deadline_reached(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
 
 
 def _canonical_free_value(model: ModelIR, variable_index: int) -> float:
@@ -399,5 +473,7 @@ def _from_normalized(model: ModelIR, value: float) -> float:
 
 
 def _relative_gap(primal: float, dual: float) -> float:
+    if not math.isfinite(primal) or not math.isfinite(dual):
+        return math.inf
     gap = max(0.0, primal - dual)
     return gap / max(1.0, abs(primal), abs(dual))

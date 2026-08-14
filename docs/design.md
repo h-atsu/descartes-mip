@@ -94,8 +94,8 @@ result = descartes_mip.solve(
   乗数box全体で部分問題目的が有限になることを保証する。ハード制約による暗黙の境界は
   推論しないため、安全だが明示的境界のないモデルもv1では保守的に拒否する。
 - `decompose()` は構造診断APIとして境界要件を課さず、`solve()` のみが検証する。
-- v1のこの段階では逐次求解のみを提供し、solver factoryには時間制限なしを表す
-  `None` を渡す。全体時間制御はMilestone 4、並列求解はMilestone 5で追加する。
+- v1のこの段階では逐次求解のみを提供する。時間制限なしではsolver factoryへ `None`、
+  制限ありでは全体期限までの残り秒数を渡す。並列求解はMilestone 5で追加する。
 
 ## Milestone 4: 時間制御・結果・障害処理
 
@@ -107,6 +107,24 @@ result = descartes_mip.solve(
 - 終了理由、最良ソフト実行可能解、スラック、元制約違反量、主・双対境界、ギャップ、
   乗数、分解構造、反復履歴を結果に含める。
 - ソフト化後の実行可能性と、元のハード制約に対する実行可能性を明確に区別する。
+
+実装済みの契約:
+
+- `time_limit` は正の有限秒数または `None` とし、モデル解析を含む `solve()` 全体の
+  monotonic wall-clock予算として扱う。
+- 各部分問題の直前に残り時間を再計算して `solver_factory(remaining_time)` へ渡す。
+  時間制限なしの場合だけ `None` を渡す。
+- `Not Solved` または期限到達によって最適性未証明となった反復は、途中まで得た部分問題
+  解をすべて破棄し、境界・履歴・乗数を更新しない。`Infeasible` と `Unbounded` は時間切れと
+  混同せず `SubproblemSolveError` とする。
+- 期限をわずかに超えても全部分問題が `Optimal` なら、その反復はcertifiedとして採用して
+  から `time_limit` 終了とする。
+- 結果には `elapsed_time`、`timed_out_subproblem`、`has_certified_bounds` を含める。
+  各完了反復と部分問題にも累積・個別の実測時間を保存する。
+- 完了反復がない場合、主・双対境界とギャップは目的方向に応じた無限値、解とスラックは
+  空、`soft_feasible` と `hard_feasible` と `has_certified_bounds` はfalseとする。
+- solver factoryやソルバー自体の例外、時間切れ以外の未定義状態は、部分問題IDを含む
+  `SubproblemSolveError` とする。
 
 ## Milestone 5: 並列求解と公開品質
 

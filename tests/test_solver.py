@@ -1,3 +1,4 @@
+import math
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -12,6 +13,25 @@ from descartes_mip import (
     highs_factory,
     solve,
 )
+
+
+class NotSolvedSolver(pulp.LpSolver):
+    """Test solver that simulates a time-limited solve without an optimum."""
+
+    def available(self) -> bool:
+        return True
+
+    def actualSolve(self, lp: pulp.LpProblem) -> int:
+        lp.assignStatus(pulp.LpStatusNotSolved, pulp.LpSolutionNoSolutionFound)
+        return pulp.LpStatusNotSolved
+
+
+class FakeTime:
+    def __init__(self, current: float = 0.0) -> None:
+        self.current = current
+
+    def monotonic(self) -> float:
+        return self.current
 
 
 def build_binary_pair(
@@ -177,6 +197,9 @@ def test_callback_stops_after_a_completed_iteration() -> None:
     [
         ("max_iterations", 0, "positive integer"),
         ("max_iterations", True, "positive integer"),
+        ("time_limit", 0, "positive finite"),
+        ("time_limit", float("inf"), "positive finite"),
+        ("time_limit", True, "positive finite"),
         ("polyak_factor", 0, "in \\(0, 2]"),
         ("polyak_factor", 3, "in \\(0, 2]"),
     ],
@@ -241,6 +264,177 @@ def test_solver_factory_is_called_once_per_subproblem_and_iteration() -> None:
     )
 
     assert calls == [None, None, None, None]
+
+
+def test_time_limit_passes_decreasing_remaining_budget_to_each_subproblem(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import descartes_mip.solver as solver_module
+
+    problem, coupling = build_binary_pair(
+        sense=pulp.LpMinimize,
+        objective=(1, 2),
+        constraint_sense=">=",
+    )
+    clock = FakeTime(100)
+    monkeypatch.setattr(solver_module, "time", clock)
+    remaining_budgets: list[float | None] = []
+
+    def factory(remaining_time: float | None) -> pulp.LpSolver:
+        remaining_budgets.append(remaining_time)
+        clock.current += 1
+        return highs_factory(remaining_time)
+
+    result = solve(
+        problem,
+        relax=[SoftConstraint(coupling, penalty=3)],
+        solver_factory=factory,
+        max_iterations=1,
+        time_limit=10,
+    )
+
+    assert remaining_budgets == pytest.approx([10, 9])
+    assert result.elapsed_time == pytest.approx(2)
+    assert result.history[0].elapsed_time == pytest.approx(2)
+    assert [record.elapsed_time for record in result.history[0].subproblems] == pytest.approx(
+        [1, 1]
+    )
+
+
+def test_time_limit_discards_an_incomplete_iteration_and_keeps_prior_bounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import descartes_mip.solver as solver_module
+
+    problem, coupling = build_binary_pair(
+        sense=pulp.LpMinimize,
+        objective=(1, 2),
+        constraint_sense=">=",
+    )
+    clock = FakeTime()
+    monkeypatch.setattr(solver_module, "time", clock)
+    calls = 0
+
+    def factory(remaining_time: float | None) -> pulp.LpSolver:
+        nonlocal calls
+        calls += 1
+        clock.current += 1
+        if calls == 4:
+            return NotSolvedSolver(msg=False, timeLimit=remaining_time)
+        return highs_factory(remaining_time)
+
+    result = solve(
+        problem,
+        relax=[SoftConstraint(coupling, penalty=3)],
+        solver_factory=factory,
+        max_iterations=10,
+        time_limit=100,
+    )
+
+    assert result.termination_reason == "time_limit"
+    assert result.iterations == 1
+    assert len(result.history) == 1
+    assert result.timed_out_subproblem == 1
+    assert result.has_certified_bounds
+    assert result.soft_feasible
+    assert result.best_primal_bound == result.history[0].best_primal_bound
+    assert result.best_dual_bound == result.history[0].best_dual_bound
+    assert result.multipliers == {"coupling": 3.0}
+
+
+def test_time_limit_before_first_iteration_returns_no_solution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import descartes_mip.solver as solver_module
+
+    problem, coupling = build_binary_pair(
+        sense=pulp.LpMinimize,
+        objective=(1, 2),
+        constraint_sense=">=",
+    )
+
+    class ExpiredTime:
+        calls = 0
+
+        def monotonic(self) -> float:
+            self.calls += 1
+            return 0.0 if self.calls == 1 else 2.0
+
+    monkeypatch.setattr(solver_module, "time", ExpiredTime())
+
+    result = solve(
+        problem,
+        relax=[SoftConstraint(coupling, penalty=3)],
+        max_iterations=10,
+        time_limit=1,
+    )
+
+    assert result.termination_reason == "time_limit"
+    assert result.iterations == 0
+    assert not result.has_certified_bounds
+    assert not result.soft_feasible
+    assert not result.hard_feasible
+    assert result.variable_values == {}
+    assert result.slacks == {}
+    assert result.best_primal_bound == math.inf
+    assert result.best_dual_bound == -math.inf
+    assert result.absolute_gap == math.inf
+    assert result.relative_gap == math.inf
+    assert result.timed_out_subproblem is None
+
+
+def test_completed_iteration_is_kept_when_solver_slightly_exceeds_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import descartes_mip.solver as solver_module
+
+    problem = pulp.LpProblem("one_component", pulp.LpMinimize)
+    x = problem.add_variable("x", lowBound=0, upBound=1)
+    problem += x
+    clock = FakeTime()
+    monkeypatch.setattr(solver_module, "time", clock)
+
+    def factory(remaining_time: float | None) -> pulp.LpSolver:
+        clock.current += 2
+        return highs_factory(remaining_time)
+
+    result = solve(
+        problem,
+        relax=[],
+        solver_factory=factory,
+        max_iterations=10,
+        time_limit=1,
+    )
+
+    assert result.termination_reason == "time_limit"
+    assert result.iterations == 1
+    assert result.has_certified_bounds
+    assert result.variable_values == {"x": 0.0}
+    assert result.elapsed_time == pytest.approx(2)
+
+
+def test_not_solved_status_without_time_limit_is_an_error() -> None:
+    problem = pulp.LpProblem("not_solved", pulp.LpMinimize)
+    x = problem.add_variable("x", lowBound=0, upBound=1)
+    problem += x
+
+    with pytest.raises(SubproblemSolveError, match="Not Solved"):
+        solve(
+            problem,
+            relax=[],
+            solver_factory=lambda _: NotSolvedSolver(msg=False),
+            max_iterations=1,
+        )
+
+
+def test_infeasible_subproblem_is_not_misreported_as_time_limit() -> None:
+    problem = pulp.LpProblem("infeasible", pulp.LpMinimize)
+    x = problem.add_variable("x", lowBound=0, upBound=1)
+    problem += x
+    problem += x >= 2, "impossible"
+
+    with pytest.raises(SubproblemSolveError, match="subproblem 0.*Infeasible"):
+        solve(problem, relax=[], max_iterations=1, time_limit=10)
 
 
 def test_solve_wraps_solver_factory_error() -> None:
