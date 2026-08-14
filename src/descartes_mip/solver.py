@@ -12,6 +12,7 @@ from threading import Lock
 import pulp
 
 from descartes_mip._model import ConstraintIR, ModelIR
+from descartes_mip.backends import SUPPORTED_SOLVERS, create_solver
 from descartes_mip.decomposition import Decomposition, SoftConstraint, decompose
 from descartes_mip.exceptions import ModelValidationError, SubproblemSolveError
 from descartes_mip.result import (
@@ -19,8 +20,7 @@ from descartes_mip.result import (
     LagrangianResult,
     SubproblemRecord,
 )
-from descartes_mip.solvers import highs_factory
-from descartes_mip.types import SolverFactory
+from descartes_mip.types import SolverClass
 
 type IterationCallback = Callable[[IterationRecord], bool]
 
@@ -51,7 +51,8 @@ def solve(
     problem: pulp.LpProblem,
     *,
     relax: Sequence[SoftConstraint],
-    solver_factory: SolverFactory = highs_factory,
+    solver: SolverClass = pulp.HiGHS,
+    solver_options: Mapping[str, object] | None = None,
     max_iterations: int = 100,
     time_limit: float | None = None,
     parallel: bool = False,
@@ -72,11 +73,13 @@ def solve(
         parallel,
         workers,
         polyak_factor,
-        solver_factory,
+        solver,
+        solver_options,
     )
     started_at = time.monotonic()
     deadline = None if time_limit is None else started_at + time_limit
     soft_constraints = tuple(relax)
+    resolved_solver_options = {} if solver_options is None else dict(solver_options)
     decomposition = decompose(problem, relax=soft_constraints)
     _validate_explicit_variable_bounds(decomposition)
     model = decomposition._model
@@ -102,7 +105,8 @@ def solve(
                 model,
                 relaxed,
                 multipliers,
-                solver_factory,
+                solver,
+                resolved_solver_options,
                 deadline,
                 parallel,
                 workers,
@@ -200,7 +204,8 @@ def _validate_options(
     parallel: bool,
     workers: int | None,
     polyak_factor: float,
-    solver_factory: SolverFactory,
+    solver: SolverClass,
+    solver_options: Mapping[str, object] | None,
 ) -> None:
     if isinstance(max_iterations, bool) or not isinstance(max_iterations, int):
         raise ModelValidationError("max_iterations must be a positive integer")
@@ -225,8 +230,20 @@ def _validate_options(
         raise ModelValidationError("polyak_factor must be finite and in (0, 2]")
     if not math.isfinite(polyak_factor) or not 0 < polyak_factor <= 2:
         raise ModelValidationError("polyak_factor must be finite and in (0, 2]")
-    if not callable(solver_factory):
-        raise ModelValidationError("solver_factory must be callable")
+    if solver not in SUPPORTED_SOLVERS:
+        supported = ", ".join(solver_class.__name__ for solver_class in SUPPORTED_SOLVERS)
+        raise ModelValidationError(
+            f"unsupported solver; expected one of these PuLP solver classes: {supported}"
+        )
+    if solver_options is not None and not isinstance(solver_options, Mapping):
+        raise ModelValidationError("solver_options must be a mapping or None")
+    if solver_options is not None:
+        if not all(isinstance(name, str) for name in solver_options):
+            raise ModelValidationError("solver_options keys must be strings")
+        if "timeLimit" in solver_options:
+            raise ModelValidationError(
+                "solver_options must not contain reserved option 'timeLimit'; use time_limit"
+            )
 
 
 def _validate_explicit_variable_bounds(decomposition: Decomposition) -> None:
@@ -346,13 +363,14 @@ def _solve_subproblems(
     model: ModelIR,
     relaxed: tuple[ConstraintIR, ...],
     multipliers: Mapping[str, float],
-    solver_factory: SolverFactory,
+    solver: SolverClass,
+    solver_options: Mapping[str, object],
     deadline: float | None,
     parallel: bool,
     workers: int | None,
 ) -> tuple[dict[str, float], tuple[SubproblemRecord, ...], float]:
     if parallel and len(subproblems) > 1:
-        factory_lock = Lock()
+        solver_creation_lock = Lock()
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = tuple(
                 executor.submit(
@@ -361,9 +379,10 @@ def _solve_subproblems(
                     model,
                     relaxed,
                     multipliers,
-                    solver_factory,
+                    solver,
+                    solver_options,
                     deadline,
-                    factory_lock,
+                    solver_creation_lock,
                 )
                 for subproblem in subproblems
             )
@@ -375,7 +394,8 @@ def _solve_subproblems(
                 model,
                 relaxed,
                 multipliers,
-                solver_factory,
+                solver,
+                solver_options,
                 deadline,
                 None,
             )
@@ -397,9 +417,10 @@ def _solve_one_subproblem(
     model: ModelIR,
     relaxed: tuple[ConstraintIR, ...],
     multipliers: Mapping[str, float],
-    solver_factory: SolverFactory,
+    solver: SolverClass,
+    solver_options: Mapping[str, object],
     deadline: float | None,
-    factory_lock: Lock | None,
+    solver_creation_lock: Lock | None,
 ) -> _SolvedSubproblem:
     coefficients = dict(subproblem.objective_coefficients)
     for constraint in relaxed:
@@ -414,18 +435,18 @@ def _solve_one_subproblem(
     subproblem.problem.setObjective(objective)
     subproblem_started_at = time.monotonic()
     try:
-        if factory_lock is None:
+        if solver_creation_lock is None:
             remaining_time = _remaining_time(deadline)
             if remaining_time is not None and remaining_time <= 0:
                 raise _TimeLimitReached(subproblem.id)
-            solver = solver_factory(remaining_time)
+            solver_instance = create_solver(solver, solver_options, remaining_time)
         else:
-            with factory_lock:
+            with solver_creation_lock:
                 remaining_time = _remaining_time(deadline)
                 if remaining_time is not None and remaining_time <= 0:
                     raise _TimeLimitReached(subproblem.id)
-                solver = solver_factory(remaining_time)
-        status = subproblem.problem.solve(solver)
+                solver_instance = create_solver(solver, solver_options, remaining_time)
+        status = subproblem.problem.solve(solver_instance)
     except _TimeLimitReached:
         raise
     except TimeoutError as error:

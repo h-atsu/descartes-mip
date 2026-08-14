@@ -61,7 +61,8 @@ decomposition = descartes_mip.decompose(problem, relax=relax)
 result = descartes_mip.solve(
     problem,
     relax=relax,
-    solver_factory=highs_factory,
+    solver=pulp.HiGHS,
+    solver_options={"msg": False},
     max_iterations=1_000,
     time_limit=300.0,
     polyak_factor=1.0,
@@ -94,8 +95,8 @@ result = descartes_mip.solve(
   乗数box全体で部分問題目的が有限になることを保証する。ハード制約による暗黙の境界は
   推論しないため、安全だが明示的境界のないモデルもv1では保守的に拒否する。
 - `decompose()` は構造診断APIとして境界要件を課さず、`solve()` のみが検証する。
-- 逐次求解を既定とする。時間制限なしではsolver factoryへ `None`、制限ありでは
-  全体期限までの残り秒数を渡す。独立な部分問題はMilestone 5の並列モードでも求解できる。
+- 逐次求解を既定とする。部分問題ごとに指定されたソルバークラスを生成し、時間制限ありでは
+  全体期限までの残り秒数を `timeLimit` に設定する。独立な部分問題はMilestone 5の並列モードでも求解できる。
 
 ## Milestone 4: 時間制御・結果・障害処理
 
@@ -112,7 +113,7 @@ result = descartes_mip.solve(
 
 - `time_limit` は正の有限秒数または `None` とし、モデル解析を含む `solve()` 全体の
   monotonic wall-clock予算として扱う。
-- 各部分問題の直前に残り時間を再計算して `solver_factory(remaining_time)` へ渡す。
+- 各部分問題の直前に残り時間を再計算し、新しいソルバーの `timeLimit` へ渡す。
   時間制限なしの場合だけ `None` を渡す。
 - `Not Solved` または期限到達によって最適性未証明となった反復は、途中まで得た部分問題
   解をすべて破棄し、境界・履歴・乗数を更新しない。`Infeasible` と `Unbounded` は時間切れと
@@ -123,7 +124,7 @@ result = descartes_mip.solve(
   各完了反復と部分問題にも累積・個別の実測時間を保存する。
 - 完了反復がない場合、主・双対境界とギャップは目的方向に応じた無限値、解とスラックは
   空、`soft_feasible` と `hard_feasible` と `has_certified_bounds` はfalseとする。
-- solver factoryやソルバー自体の例外、時間切れ以外の未定義状態は、部分問題IDを含む
+- ソルバー生成や求解時の例外、時間切れ以外の未定義状態は、部分問題IDを含む
   `SubproblemSolveError` とする。
 
 ## Milestone 5: 並列求解と公開品質
@@ -132,23 +133,26 @@ result = descartes_mip.solve(
 - 部分問題ごとに独立したソルバーインスタンスを生成する。
 - 並列実行後は部分問題ID順に決定論的に集約する。
 - チュートリアル、完全なサンプル、APIドキュメントを追加する。
-- HiGHSを公式検証対象とし、PuLPの任意ソルバーを受け付ける。
-- CBCなどについて基本的な互換テストを行う。
+- HiGHSとCBCの明示したPuLPソルバークラスを受け付け、それ以外は検証エラーとする。
+- CBCについて基本的な互換テストを行う。
 
 実装済みの契約:
 
 - `parallel=False` を既定とし、`parallel=True` で複数の部分問題をスレッドプールへ
   投入する。`workers` は正の整数または `None` で、並列モードでのみ指定できる。
-- solver factoryは各部分問題・各反復で一度ずつ呼び、必ず独立したソルバーインスタンスを
-  得る。factory呼び出しはロックで直列化し、返されたソルバーによる求解だけを並列実行する。
+- 指定されたソルバークラスを各部分問題・各反復で一度ずつ呼び、必ず独立したインスタンスを
+  得る。インスタンス生成はロックで直列化し、生成後の求解だけを並列実行する。
 - 並列タスクの完了順には依存せず、結果、目的値、履歴を部分問題ID順に集約する。これにより
   同じ決定論的ソルバーを使う限り、逐次・並列で同じ数値結果と履歴順を得る。
 - 一つでも部分問題が時間内に最適性を証明できなければ、逐次モードと同様に反復全体を破棄する。
-  各タスクにはfactory生成時点の全体残り時間を渡すため、ソルバー停止精度やスレッド終了待ちに
+  各インスタンスには生成時点の全体残り時間を渡すため、ソルバー停止精度やスレッド終了待ちに
   よる小さなwall-clock超過は許容する。
 - 部分問題が一つだけの場合は、`parallel=True` でもスレッド生成を省略して逐次経路を使う。
-- HiGHSを既定かつ公式検証対象とする。標準PuLPステータスを返す任意のソルバーをfactory経由で
-  利用でき、同梱CBCによる基本的な逐次・並列互換性をテストする。
+- HiGHSを既定かつ公式検証対象とし、同梱CBCによる基本的な逐次・並列互換性もテストする。
+  サポートするクラスは `pulp.HiGHS` と `pulp.COIN_CMD` に限定し、それ以外のクラスや
+  インスタンスは求解前に `ModelValidationError` とする。
+- ソルバー固有のキーワードは `solver_options` で受け取る。`msg=False` を既定とし、全体時間
+  予算から設定する `timeLimit` は予約済みとして利用者による上書きを拒否する。
 - 公開APIの契約を `docs/api.md`、モデル構築から結果確認までの完全な例を
   `examples/tutorial.py` に置く。パッケージは `py.typed` を含み型情報を公開する。
 
@@ -160,7 +164,8 @@ result = descartes_mip.solve(
 - `Decomposition`: 成分、変数、ハード制約、緩和制約の対応を保持する。
 - `LagrangianResult`: 最良解、境界、乗数、履歴、終了理由、保証状態を保持する。
 - `IterationRecord`: 各反復の残差、ステップ幅、主・双対値、経過時間、部分問題状態を保持する。
-- `solver_factory(remaining_time)`: 求解ごとにPuLPソルバーを生成する。
+- `SolverClass`: サポート対象のPuLPソルバークラスを表す。
+- `SUPPORTED_SOLVERS`: `solve()` が受け付けるソルバークラスのタプル。
 
 ## Test Plan
 

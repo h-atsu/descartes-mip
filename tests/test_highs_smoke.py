@@ -1,7 +1,5 @@
 import pulp
 
-from descartes_mip import highs_factory
-
 
 def test_highs_solves_a_minimal_milp_to_optimality() -> None:
     problem = pulp.LpProblem("smoke", pulp.LpMinimize)
@@ -9,7 +7,7 @@ def test_highs_solves_a_minimal_milp_to_optimality() -> None:
     problem += x
     problem += x >= 3
 
-    status = problem.solve(highs_factory(None))
+    status = problem.solve(pulp.HiGHS(msg=False))
 
     assert status == pulp.LpStatusOptimal
     assert pulp.value(x) == 3

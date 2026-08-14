@@ -21,6 +21,8 @@ def main() -> None:
     result = solve(
         problem,
         relax=relaxed,
+        solver=pulp.HiGHS,
+        solver_options={"msg": False},
         max_iterations=50,
         time_limit=30,
         parallel=True,

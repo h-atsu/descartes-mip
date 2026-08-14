@@ -44,6 +44,8 @@ from descartes_mip import solve
 result = solve(
     problem,
     relax=[SoftConstraint(coupling, penalty=100.0)],
+    solver=pulp.HiGHS,
+    solver_options={"msg": False, "gapRel": 1e-9},
     max_iterations=100,
     time_limit=300.0,
     parallel=True,
@@ -65,9 +67,9 @@ v1では、`solve()` に渡すモデルの全決定変数に、有限な下限�
 すべての部分問題が有界であることを単純に保証します。ハード制約から上下限を推論する
 処理は行わないため、暗黙に有界な変数にも明示的な境界を設定してください。
 
-`time_limit` は `solve()` 全体のwall-clock予算です。各部分問題を解く直前に残り時間を
-`solver_factory(remaining_time)` へ渡します。時間内に全部分問題の最適性を証明できなかった
-反復は破棄し、直前までに完了した反復のcertified境界と解だけを返します。ソルバーの
+`time_limit` は `solve()` 全体のwall-clock予算です。各部分問題を解く直前に、指定された
+ソルバークラスから残り時間付きの独立インスタンスを生成します。時間内に全部分問題の
+最適性を証明できなかった反復は破棄し、直前までに完了した反復のcertified境界と解だけを返します。ソルバーの
 停止精度により小さな超過はあり得ますが、期限を超えても反復全体が最適に解けた場合は、
 その反復を有効な結果として採用します。
 
@@ -76,8 +78,10 @@ v1では、`solve()` に渡すモデルの全決定変数に、有限な下限�
 `result.has_certified_bounds` と `result.soft_feasible` はともに `False` です。
 
 並列求解でも部分問題ごとに新しいソルバーを生成し、結果と履歴は部分問題ID順に
-決定論的に集約します。独自のPuLPソルバーを利用する場合は、呼び出しごとに新しい
-インスタンスを返す `solver_factory(remaining_time)` を渡してください。
+決定論的に集約します。サポートするソルバークラスは `pulp.HiGHS` と
+`pulp.COIN_CMD` です。それ以外のクラスやソルバーインスタンスは
+`ModelValidationError` で拒否します。固有設定は `solver_options` へ渡せますが、全体時間を
+管理する `timeLimit` は予約済みなので、代わりに `solve()` の `time_limit` を指定してください。
 
 ## 開発環境
 

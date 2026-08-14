@@ -30,7 +30,8 @@ solve(
     problem: pulp.LpProblem,
     *,
     relax: Sequence[SoftConstraint],
-    solver_factory: SolverFactory = highs_factory,
+    solver: SolverClass = pulp.HiGHS,
+    solver_options: Mapping[str, object] | None = None,
     max_iterations: int = 100,
     time_limit: float | None = None,
     parallel: bool = False,
@@ -48,10 +49,13 @@ projected Polyak subgradient steps.
 - `time_limit` is a global monotonic wall-clock budget. An incomplete iteration is discarded.
 - `parallel=True` solves independent subproblems in a thread pool. `workers` controls its maximum
   concurrency and is only valid in parallel mode.
-- The factory is called once per subproblem solve and must return a new solver instance. Factory
-  creation is serialized; the returned solvers execute concurrently.
-- The default and CI reference backend is HiGHS. Other PuLP solvers are accepted when they report
-  statuses through the standard PuLP interface.
+- A fresh solver instance is constructed for every subproblem solve. Instance creation is
+  serialized; the resulting solvers execute concurrently.
+- Supported classes are `pulp.HiGHS` and `pulp.COIN_CMD`. Passing any other class or an existing
+  solver instance raises `ModelValidationError` before decomposition or solving starts.
+- `solver_options` are forwarded as keyword arguments to every new instance. `msg=False` is the
+  default and can be overridden. `timeLimit` is reserved because the library derives it from the
+  global `time_limit` budget.
 
 For minimization, `best_primal_bound` is a soft-feasible upper bound and `best_dual_bound` is a
 certified lower bound. For maximization they are respectively a lower and upper bound.
@@ -71,11 +75,18 @@ Each `IterationRecord` stores the current and incumbent bounds, step size, multi
 violations, variable values, subproblem records, and cumulative elapsed time. Each
 `SubproblemRecord` stores its ID, PuLP status, Lagrangian objective contribution, and elapsed time.
 
-## Solver factories
+## Solvers
 
 ```python
-highs_factory(remaining_time: float | None) -> pulp.LpSolver
+solve(
+    problem,
+    relax=relaxed,
+    solver=pulp.HiGHS,
+    solver_options={"msg": False, "gapRel": 1e-9},
+)
 ```
 
-`highs_factory` creates a quiet independent HiGHS instance and applies the supplied remaining-time
-limit. A custom factory may construct any compatible PuLP solver in the same way.
+`SUPPORTED_SOLVERS` exposes the exact accepted class tuple. The class itself—not an instantiated
+solver—is supplied so sequential and parallel modes can both create one independent backend per
+subproblem. CBC can be selected with `solver=pulp.COIN_CMD` when its executable is available; a
+nonstandard executable location can be supplied as `solver_options={"path": "..."}`.

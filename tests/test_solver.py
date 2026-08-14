@@ -1,17 +1,16 @@
 import math
-import warnings
-from collections.abc import Callable
 from typing import Any, cast
 
 import pulp
 import pytest
 
 from descartes_mip import (
+    SUPPORTED_SOLVERS,
     IterationRecord,
     ModelValidationError,
     SoftConstraint,
+    SolverClass,
     SubproblemSolveError,
-    highs_factory,
     solve,
 )
 
@@ -35,10 +34,16 @@ class FakeTime:
         return self.current
 
 
+def bundled_cbc_path() -> str:
+    return pulp.PULP_CBC_CMD.pulp_cbc_path
+
+
 def bundled_cbc_available() -> bool:
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        return bool(pulp.PULP_CBC_CMD(msg=False).available())
+    return bool(pulp.COIN_CMD(path=bundled_cbc_path(), msg=False).available())
+
+
+def test_supported_solver_classes_are_explicit() -> None:
+    assert SUPPORTED_SOLVERS == (pulp.HiGHS, pulp.COIN_CMD)
 
 
 def build_binary_pair(
@@ -90,7 +95,7 @@ def test_solve_ge_constraint_finds_matching_certified_bounds() -> None:
     slack = direct.add_variable("slack", lowBound=0)
     direct += x + 2 * y + 3 * slack
     direct += x + y + slack >= 1
-    assert direct.solve(highs_factory(None)) == pulp.LpStatusOptimal
+    assert direct.solve(pulp.HiGHS(msg=False)) == pulp.LpStatusOptimal
     assert result.best_primal_bound == pytest.approx(pulp.value(direct.objective))
 
 
@@ -251,26 +256,37 @@ def test_solve_rejects_a_variable_without_explicit_bounds() -> None:
         solve(problem, relax=[], max_iterations=1)
 
 
-def test_solver_factory_is_called_once_per_subproblem_and_iteration() -> None:
+def test_solver_class_is_instantiated_once_per_subproblem_and_iteration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import descartes_mip.solver as solver_module
+
     problem, coupling = build_binary_pair(
         sense=pulp.LpMinimize,
         objective=(1, 2),
         constraint_sense=">=",
     )
-    calls: list[float | None] = []
+    calls: list[tuple[SolverClass, dict[str, object], float | None]] = []
+    original_create_solver = solver_module.create_solver
 
-    def factory(remaining_time: float | None) -> pulp.LpSolver:
-        calls.append(remaining_time)
-        return highs_factory(remaining_time)
+    def create_solver(
+        solver: SolverClass,
+        options: dict[str, object],
+        remaining_time: float | None,
+    ) -> pulp.LpSolver:
+        calls.append((solver, options, remaining_time))
+        return original_create_solver(solver, options, remaining_time)
+
+    monkeypatch.setattr(solver_module, "create_solver", create_solver)
 
     solve(
         problem,
         relax=[SoftConstraint(coupling, penalty=3)],
-        solver_factory=factory,
+        solver_options={"gapRel": 0.0},
         max_iterations=2,
     )
 
-    assert calls == [None, None, None, None]
+    assert calls == [(pulp.HiGHS, {"gapRel": 0.0}, None)] * 4
 
 
 def test_time_limit_passes_decreasing_remaining_budget_to_each_subproblem(
@@ -287,15 +303,22 @@ def test_time_limit_passes_decreasing_remaining_budget_to_each_subproblem(
     monkeypatch.setattr(solver_module, "time", clock)
     remaining_budgets: list[float | None] = []
 
-    def factory(remaining_time: float | None) -> pulp.LpSolver:
+    original_create_solver = solver_module.create_solver
+
+    def create_solver(
+        solver: SolverClass,
+        options: dict[str, object],
+        remaining_time: float | None,
+    ) -> pulp.LpSolver:
         remaining_budgets.append(remaining_time)
         clock.current += 1
-        return highs_factory(remaining_time)
+        return original_create_solver(solver, options, remaining_time)
+
+    monkeypatch.setattr(solver_module, "create_solver", create_solver)
 
     result = solve(
         problem,
         relax=[SoftConstraint(coupling, penalty=3)],
-        solver_factory=factory,
         max_iterations=1,
         time_limit=10,
     )
@@ -322,18 +345,25 @@ def test_time_limit_discards_an_incomplete_iteration_and_keeps_prior_bounds(
     monkeypatch.setattr(solver_module, "time", clock)
     calls = 0
 
-    def factory(remaining_time: float | None) -> pulp.LpSolver:
+    original_create_solver = solver_module.create_solver
+
+    def create_solver(
+        solver: SolverClass,
+        options: dict[str, object],
+        remaining_time: float | None,
+    ) -> pulp.LpSolver:
         nonlocal calls
         calls += 1
         clock.current += 1
         if calls == 4:
             return NotSolvedSolver(msg=False, timeLimit=remaining_time)
-        return highs_factory(remaining_time)
+        return original_create_solver(solver, options, remaining_time)
+
+    monkeypatch.setattr(solver_module, "create_solver", create_solver)
 
     result = solve(
         problem,
         relax=[SoftConstraint(coupling, penalty=3)],
-        solver_factory=factory,
         max_iterations=10,
         time_limit=100,
     )
@@ -401,14 +431,21 @@ def test_completed_iteration_is_kept_when_solver_slightly_exceeds_deadline(
     clock = FakeTime()
     monkeypatch.setattr(solver_module, "time", clock)
 
-    def factory(remaining_time: float | None) -> pulp.LpSolver:
+    original_create_solver = solver_module.create_solver
+
+    def create_solver(
+        solver: SolverClass,
+        options: dict[str, object],
+        remaining_time: float | None,
+    ) -> pulp.LpSolver:
         clock.current += 2
-        return highs_factory(remaining_time)
+        return original_create_solver(solver, options, remaining_time)
+
+    monkeypatch.setattr(solver_module, "create_solver", create_solver)
 
     result = solve(
         problem,
         relax=[],
-        solver_factory=factory,
         max_iterations=10,
         time_limit=1,
     )
@@ -420,18 +457,23 @@ def test_completed_iteration_is_kept_when_solver_slightly_exceeds_deadline(
     assert result.elapsed_time == pytest.approx(2)
 
 
-def test_not_solved_status_without_time_limit_is_an_error() -> None:
+def test_not_solved_status_without_time_limit_is_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import descartes_mip.solver as solver_module
+
     problem = pulp.LpProblem("not_solved", pulp.LpMinimize)
     x = problem.add_variable("x", lowBound=0, upBound=1)
     problem += x
 
+    monkeypatch.setattr(
+        solver_module,
+        "create_solver",
+        lambda solver, options, remaining: NotSolvedSolver(msg=False),
+    )
+
     with pytest.raises(SubproblemSolveError, match="Not Solved"):
-        solve(
-            problem,
-            relax=[],
-            solver_factory=lambda _: NotSolvedSolver(msg=False),
-            max_iterations=1,
-        )
+        solve(problem, relax=[], max_iterations=1)
 
 
 def test_infeasible_subproblem_is_not_misreported_as_time_limit() -> None:
@@ -479,23 +521,33 @@ def test_parallel_solve_matches_sequential_certified_results() -> None:
     )
 
 
-def test_parallel_solve_creates_an_independent_solver_for_each_subproblem() -> None:
+def test_parallel_solve_creates_an_independent_solver_for_each_subproblem(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import descartes_mip.solver as solver_module
+
     problem, coupling = build_binary_pair(
         sense=pulp.LpMinimize,
         objective=(1, 2),
         constraint_sense=">=",
     )
     solvers: list[pulp.LpSolver] = []
+    original_create_solver = solver_module.create_solver
 
-    def factory(remaining_time: float | None) -> pulp.LpSolver:
-        solver = highs_factory(remaining_time)
-        solvers.append(solver)
-        return solver
+    def create_solver(
+        solver: SolverClass,
+        options: dict[str, object],
+        remaining_time: float | None,
+    ) -> pulp.LpSolver:
+        instance = original_create_solver(solver, options, remaining_time)
+        solvers.append(instance)
+        return instance
+
+    monkeypatch.setattr(solver_module, "create_solver", create_solver)
 
     solve(
         problem,
         relax=[SoftConstraint(coupling, penalty=3)],
-        solver_factory=factory,
         max_iterations=1,
         parallel=True,
         workers=2,
@@ -505,20 +557,29 @@ def test_parallel_solve_creates_an_independent_solver_for_each_subproblem() -> N
     assert solvers[0] is not solvers[1]
 
 
-def test_parallel_time_limit_discards_the_whole_iteration() -> None:
+def test_parallel_time_limit_discards_the_whole_iteration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import descartes_mip.solver as solver_module
+
     problem, coupling = build_binary_pair(
         sense=pulp.LpMinimize,
         objective=(1, 2),
         constraint_sense=">=",
     )
 
-    result = solve(
-        problem,
-        relax=[SoftConstraint(coupling, penalty=3)],
-        solver_factory=lambda remaining: NotSolvedSolver(
+    monkeypatch.setattr(
+        solver_module,
+        "create_solver",
+        lambda solver, options, remaining: NotSolvedSolver(
             msg=False,
             timeLimit=remaining,
         ),
+    )
+
+    result = solve(
+        problem,
+        relax=[SoftConstraint(coupling, penalty=3)],
         max_iterations=2,
         time_limit=10,
         parallel=True,
@@ -552,23 +613,19 @@ def test_solve_rejects_invalid_parallel_options(options: dict[str, Any], message
         solve(problem, relax=[SoftConstraint(coupling, penalty=3)], **options)
 
 
-@pytest.mark.skipif(not bundled_cbc_available(), reason="bundled CBC is unavailable")
-def test_cbc_solver_factory_is_compatible() -> None:
+@pytest.mark.skipif(not bundled_cbc_available(), reason="CBC is unavailable")
+def test_cbc_solver_class_is_compatible() -> None:
     problem, coupling = build_binary_pair(
         sense=pulp.LpMinimize,
         objective=(1, 2),
         constraint_sense=">=",
     )
 
-    def cbc_factory(remaining_time: float | None) -> pulp.LpSolver:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            return pulp.PULP_CBC_CMD(msg=False, timeLimit=remaining_time)
-
     result = solve(
         problem,
         relax=[SoftConstraint(coupling, penalty=3)],
-        solver_factory=cbc_factory,
+        solver=pulp.COIN_CMD,
+        solver_options={"path": bundled_cbc_path()},
         initial_multipliers={"coupling": 1.5},
         max_iterations=1,
         parallel=True,
@@ -580,37 +637,84 @@ def test_cbc_solver_factory_is_compatible() -> None:
     assert result.has_certified_bounds
 
 
-def test_solve_wraps_solver_factory_error() -> None:
+def test_solve_wraps_solver_construction_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    import descartes_mip.solver as solver_module
+
     problem, coupling = build_binary_pair(
         sense=pulp.LpMinimize,
         objective=(1, 2),
         constraint_sense=">=",
     )
 
-    def broken_factory(_: float | None) -> pulp.LpSolver:
+    def broken_create_solver(
+        solver: SolverClass,
+        options: dict[str, object],
+        remaining_time: float | None,
+    ) -> pulp.LpSolver:
         raise RuntimeError("broken")
 
+    monkeypatch.setattr(solver_module, "create_solver", broken_create_solver)
+
     with pytest.raises(SubproblemSolveError, match="solver raised RuntimeError: broken"):
+        solve(problem, relax=[SoftConstraint(coupling, penalty=3)], max_iterations=1)
+
+
+@pytest.mark.parametrize("unsupported", [pulp.GLPK_CMD, NotSolvedSolver])
+def test_solve_rejects_unsupported_solver_class(unsupported: SolverClass) -> None:
+    problem, coupling = build_binary_pair(
+        sense=pulp.LpMinimize,
+        objective=(1, 2),
+        constraint_sense=">=",
+    )
+
+    with pytest.raises(ModelValidationError, match="unsupported solver.*HiGHS.*COIN_CMD"):
         solve(
             problem,
             relax=[SoftConstraint(coupling, penalty=3)],
-            solver_factory=broken_factory,
+            solver=unsupported,
             max_iterations=1,
         )
 
 
-def test_solve_rejects_non_callable_solver_factory() -> None:
+def test_solve_rejects_a_solver_instance() -> None:
     problem, coupling = build_binary_pair(
         sense=pulp.LpMinimize,
         objective=(1, 2),
         constraint_sense=">=",
     )
 
-    with pytest.raises(ModelValidationError, match="solver_factory"):
+    with pytest.raises(ModelValidationError, match="unsupported solver"):
         solve(
             problem,
             relax=[SoftConstraint(coupling, penalty=3)],
-            solver_factory=cast(Callable[[float | None], pulp.LpSolver], None),
+            solver=cast(SolverClass, pulp.HiGHS(msg=False)),
+            max_iterations=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("solver_options", "message"),
+    [
+        ([], "mapping or None"),
+        ({1: "invalid"}, "keys must be strings"),
+        ({"timeLimit": 1}, "reserved option 'timeLimit'"),
+    ],
+)
+def test_solve_rejects_invalid_solver_options(
+    solver_options: Any,
+    message: str,
+) -> None:
+    problem, coupling = build_binary_pair(
+        sense=pulp.LpMinimize,
+        objective=(1, 2),
+        constraint_sense=">=",
+    )
+
+    with pytest.raises(ModelValidationError, match=message):
+        solve(
+            problem,
+            relax=[SoftConstraint(coupling, penalty=3)],
+            solver_options=solver_options,
             max_iterations=1,
         )
 

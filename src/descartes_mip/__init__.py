@@ -1,5 +1,6 @@
 """Automatic Lagrangian decomposition for PuLP models."""
 
+from descartes_mip.backends import SUPPORTED_SOLVERS
 from descartes_mip.decomposition import (
     Decomposition,
     LinearTerm,
@@ -16,10 +17,10 @@ from descartes_mip.exceptions import (
 )
 from descartes_mip.result import IterationRecord, LagrangianResult, SubproblemRecord
 from descartes_mip.solver import IterationCallback, solve
-from descartes_mip.solvers import highs_factory
-from descartes_mip.types import SolverFactory
+from descartes_mip.types import SolverClass
 
 __all__ = [
+    "SUPPORTED_SOLVERS",
     "Decomposition",
     "DescartesMipError",
     "IterationCallback",
@@ -30,12 +31,11 @@ __all__ = [
     "RelaxedConstraint",
     "RelaxedTerm",
     "SoftConstraint",
-    "SolverFactory",
+    "SolverClass",
     "Subproblem",
     "SubproblemRecord",
     "SubproblemSolveError",
     "decompose",
-    "highs_factory",
     "solve",
 ]
 
