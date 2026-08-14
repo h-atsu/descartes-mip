@@ -1,4 +1,5 @@
 import math
+import warnings
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -32,6 +33,12 @@ class FakeTime:
 
     def monotonic(self) -> float:
         return self.current
+
+
+def bundled_cbc_available() -> bool:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        return bool(pulp.PULP_CBC_CMD(msg=False).available())
 
 
 def build_binary_pair(
@@ -435,6 +442,142 @@ def test_infeasible_subproblem_is_not_misreported_as_time_limit() -> None:
 
     with pytest.raises(SubproblemSolveError, match="subproblem 0.*Infeasible"):
         solve(problem, relax=[], max_iterations=1, time_limit=10)
+
+
+def test_parallel_solve_matches_sequential_certified_results() -> None:
+    problem, coupling = build_binary_pair(
+        sense=pulp.LpMinimize,
+        objective=(1, 2),
+        constraint_sense=">=",
+    )
+
+    sequential = solve(
+        problem,
+        relax=[SoftConstraint(coupling, penalty=3)],
+        max_iterations=4,
+    )
+    parallel = solve(
+        problem,
+        relax=[SoftConstraint(coupling, penalty=3)],
+        max_iterations=4,
+        parallel=True,
+        workers=2,
+    )
+
+    assert parallel.best_primal_bound == pytest.approx(sequential.best_primal_bound)
+    assert parallel.best_dual_bound == pytest.approx(sequential.best_dual_bound)
+    assert parallel.absolute_gap == pytest.approx(sequential.absolute_gap)
+    assert parallel.variable_values == sequential.variable_values
+    assert parallel.slacks == sequential.slacks
+    assert parallel.multipliers == sequential.multipliers
+    assert [
+        [subproblem.subproblem_id for subproblem in record.subproblems]
+        for record in parallel.history
+    ] == [[0, 1]] * 4
+    assert [record.dual_bound for record in parallel.history] == pytest.approx(
+        [record.dual_bound for record in sequential.history]
+    )
+
+
+def test_parallel_solve_creates_an_independent_solver_for_each_subproblem() -> None:
+    problem, coupling = build_binary_pair(
+        sense=pulp.LpMinimize,
+        objective=(1, 2),
+        constraint_sense=">=",
+    )
+    solvers: list[pulp.LpSolver] = []
+
+    def factory(remaining_time: float | None) -> pulp.LpSolver:
+        solver = highs_factory(remaining_time)
+        solvers.append(solver)
+        return solver
+
+    solve(
+        problem,
+        relax=[SoftConstraint(coupling, penalty=3)],
+        solver_factory=factory,
+        max_iterations=1,
+        parallel=True,
+        workers=2,
+    )
+
+    assert len(solvers) == 2
+    assert solvers[0] is not solvers[1]
+
+
+def test_parallel_time_limit_discards_the_whole_iteration() -> None:
+    problem, coupling = build_binary_pair(
+        sense=pulp.LpMinimize,
+        objective=(1, 2),
+        constraint_sense=">=",
+    )
+
+    result = solve(
+        problem,
+        relax=[SoftConstraint(coupling, penalty=3)],
+        solver_factory=lambda remaining: NotSolvedSolver(
+            msg=False,
+            timeLimit=remaining,
+        ),
+        max_iterations=2,
+        time_limit=10,
+        parallel=True,
+        workers=2,
+    )
+
+    assert result.termination_reason == "time_limit"
+    assert result.iterations == 0
+    assert result.timed_out_subproblem == 0
+    assert not result.has_certified_bounds
+    assert result.history == ()
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"parallel": "yes"}, "parallel must be a boolean"),
+        ({"parallel": True, "workers": 0}, "positive integer"),
+        ({"parallel": True, "workers": True}, "positive integer"),
+        ({"workers": 2}, "requires parallel"),
+    ],
+)
+def test_solve_rejects_invalid_parallel_options(options: dict[str, Any], message: str) -> None:
+    problem, coupling = build_binary_pair(
+        sense=pulp.LpMinimize,
+        objective=(1, 2),
+        constraint_sense=">=",
+    )
+
+    with pytest.raises(ModelValidationError, match=message):
+        solve(problem, relax=[SoftConstraint(coupling, penalty=3)], **options)
+
+
+@pytest.mark.skipif(not bundled_cbc_available(), reason="bundled CBC is unavailable")
+def test_cbc_solver_factory_is_compatible() -> None:
+    problem, coupling = build_binary_pair(
+        sense=pulp.LpMinimize,
+        objective=(1, 2),
+        constraint_sense=">=",
+    )
+
+    def cbc_factory(remaining_time: float | None) -> pulp.LpSolver:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            return pulp.PULP_CBC_CMD(msg=False, timeLimit=remaining_time)
+
+    result = solve(
+        problem,
+        relax=[SoftConstraint(coupling, penalty=3)],
+        solver_factory=cbc_factory,
+        initial_multipliers={"coupling": 1.5},
+        max_iterations=1,
+        parallel=True,
+        workers=2,
+    )
+
+    assert result.best_primal_bound == pytest.approx(1)
+    assert result.best_dual_bound == pytest.approx(1)
+    assert result.has_certified_bounds
 
 
 def test_solve_wraps_solver_factory_error() -> None:

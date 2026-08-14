@@ -1,11 +1,13 @@
-"""Sequential projected-subgradient solver for the Lagrangian dual."""
+"""Projected-subgradient solver for the Lagrangian dual."""
 
 from __future__ import annotations
 
 import math
 import time
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from threading import Lock
 
 import pulp
 
@@ -31,6 +33,13 @@ class _BuiltSubproblem:
     objective_coefficients: dict[int, float]
 
 
+@dataclass(slots=True)
+class _SolvedSubproblem:
+    values: dict[str, float]
+    record: SubproblemRecord
+    objective_value: float
+
+
 class _TimeLimitReached(Exception):
     """Signal that an incomplete iteration must be discarded."""
 
@@ -45,6 +54,8 @@ def solve(
     solver_factory: SolverFactory = highs_factory,
     max_iterations: int = 100,
     time_limit: float | None = None,
+    parallel: bool = False,
+    workers: int | None = None,
     polyak_factor: float = 1.0,
     initial_multipliers: Mapping[str, float] | None = None,
     callback: IterationCallback | None = None,
@@ -55,7 +66,14 @@ def solve(
     are reported in the original objective sense: a primal upper and dual lower
     bound for minimization, and a primal lower and dual upper bound for maximization.
     """
-    _validate_options(max_iterations, time_limit, polyak_factor, solver_factory)
+    _validate_options(
+        max_iterations,
+        time_limit,
+        parallel,
+        workers,
+        polyak_factor,
+        solver_factory,
+    )
     started_at = time.monotonic()
     deadline = None if time_limit is None else started_at + time_limit
     soft_constraints = tuple(relax)
@@ -86,6 +104,8 @@ def solve(
                 multipliers,
                 solver_factory,
                 deadline,
+                parallel,
+                workers,
             )
         except _TimeLimitReached as timeout:
             termination_reason = "time_limit"
@@ -177,6 +197,8 @@ def solve(
 def _validate_options(
     max_iterations: int,
     time_limit: float | None,
+    parallel: bool,
+    workers: int | None,
     polyak_factor: float,
     solver_factory: SolverFactory,
 ) -> None:
@@ -191,6 +213,14 @@ def _validate_options(
         or time_limit <= 0
     ):
         raise ModelValidationError("time_limit must be a positive finite number or None")
+    if not isinstance(parallel, bool):
+        raise ModelValidationError("parallel must be a boolean")
+    if workers is not None and (
+        isinstance(workers, bool) or not isinstance(workers, int) or workers <= 0
+    ):
+        raise ModelValidationError("workers must be a positive integer or None")
+    if workers is not None and not parallel:
+        raise ModelValidationError("workers requires parallel=True")
     if isinstance(polyak_factor, bool) or not isinstance(polyak_factor, (int, float)):
         raise ModelValidationError("polyak_factor must be finite and in (0, 2]")
     if not math.isfinite(polyak_factor) or not 0 < polyak_factor <= 2:
@@ -318,72 +348,130 @@ def _solve_subproblems(
     multipliers: Mapping[str, float],
     solver_factory: SolverFactory,
     deadline: float | None,
+    parallel: bool,
+    workers: int | None,
 ) -> tuple[dict[str, float], tuple[SubproblemRecord, ...], float]:
+    if parallel and len(subproblems) > 1:
+        factory_lock = Lock()
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = tuple(
+                executor.submit(
+                    _solve_one_subproblem,
+                    subproblem,
+                    model,
+                    relaxed,
+                    multipliers,
+                    solver_factory,
+                    deadline,
+                    factory_lock,
+                )
+                for subproblem in subproblems
+            )
+            solved = tuple(future.result() for future in futures)
+    else:
+        solved = tuple(
+            _solve_one_subproblem(
+                subproblem,
+                model,
+                relaxed,
+                multipliers,
+                solver_factory,
+                deadline,
+                None,
+            )
+            for subproblem in subproblems
+        )
+
     values: dict[str, float] = {}
     records: list[SubproblemRecord] = []
     total_objective = 0.0
-    for subproblem in subproblems:
-        remaining_time = _remaining_time(deadline)
-        if remaining_time is not None and remaining_time <= 0:
-            raise _TimeLimitReached(subproblem.id)
-        coefficients = dict(subproblem.objective_coefficients)
-        for constraint in relaxed:
-            multiplier = multipliers[constraint.name]
-            term_sign = _constraint_sign(constraint)
-            for term in constraint.terms:
-                if term.variable_index in subproblem.variables:
-                    coefficients[term.variable_index] += multiplier * term_sign * term.coefficient
-        objective = pulp.lpSum(
-            coefficients[index] * variable for index, variable in subproblem.variables.items()
-        )
-        subproblem.problem.setObjective(objective)
-        subproblem_started_at = time.monotonic()
-        try:
-            solver = solver_factory(remaining_time)
-            status = subproblem.problem.solve(solver)
-        except TimeoutError as error:
-            if deadline is not None:
-                raise _TimeLimitReached(subproblem.id) from error
-            raise SubproblemSolveError(
-                f"subproblem {subproblem.id} solver raised TimeoutError: {error}"
-            ) from error
-        except Exception as error:
-            raise SubproblemSolveError(
-                f"subproblem {subproblem.id} solver raised {type(error).__name__}: {error}"
-            ) from error
-        status_name = pulp.LpStatus.get(status, f"Unknown({status})")
-        if status != pulp.LpStatusOptimal:
-            if status in (pulp.LpStatusInfeasible, pulp.LpStatusUnbounded):
-                raise SubproblemSolveError(
-                    f"subproblem {subproblem.id} did not reach optimality: {status_name}"
-                )
-            if deadline is not None and (
-                status == pulp.LpStatusNotSolved or _deadline_reached(deadline)
-            ):
+    for outcome in solved:
+        values.update(outcome.values)
+        records.append(outcome.record)
+        total_objective += outcome.objective_value
+    return values, tuple(records), total_objective
+
+
+def _solve_one_subproblem(
+    subproblem: _BuiltSubproblem,
+    model: ModelIR,
+    relaxed: tuple[ConstraintIR, ...],
+    multipliers: Mapping[str, float],
+    solver_factory: SolverFactory,
+    deadline: float | None,
+    factory_lock: Lock | None,
+) -> _SolvedSubproblem:
+    coefficients = dict(subproblem.objective_coefficients)
+    for constraint in relaxed:
+        multiplier = multipliers[constraint.name]
+        term_sign = _constraint_sign(constraint)
+        for term in constraint.terms:
+            if term.variable_index in subproblem.variables:
+                coefficients[term.variable_index] += multiplier * term_sign * term.coefficient
+    objective = pulp.lpSum(
+        coefficients[index] * variable for index, variable in subproblem.variables.items()
+    )
+    subproblem.problem.setObjective(objective)
+    subproblem_started_at = time.monotonic()
+    try:
+        if factory_lock is None:
+            remaining_time = _remaining_time(deadline)
+            if remaining_time is not None and remaining_time <= 0:
                 raise _TimeLimitReached(subproblem.id)
+            solver = solver_factory(remaining_time)
+        else:
+            with factory_lock:
+                remaining_time = _remaining_time(deadline)
+                if remaining_time is not None and remaining_time <= 0:
+                    raise _TimeLimitReached(subproblem.id)
+                solver = solver_factory(remaining_time)
+        status = subproblem.problem.solve(solver)
+    except _TimeLimitReached:
+        raise
+    except TimeoutError as error:
+        if deadline is not None:
+            raise _TimeLimitReached(subproblem.id) from error
+        raise SubproblemSolveError(
+            f"subproblem {subproblem.id} solver raised TimeoutError: {error}"
+        ) from error
+    except Exception as error:
+        raise SubproblemSolveError(
+            f"subproblem {subproblem.id} solver raised {type(error).__name__}: {error}"
+        ) from error
+    status_name = pulp.LpStatus.get(status, f"Unknown({status})")
+    if status != pulp.LpStatusOptimal:
+        if status in (pulp.LpStatusInfeasible, pulp.LpStatusUnbounded):
             raise SubproblemSolveError(
                 f"subproblem {subproblem.id} did not reach optimality: {status_name}"
             )
-        objective_value = float(pulp.value(subproblem.problem.objective) or 0.0)
-        total_objective += objective_value
-        records.append(
-            SubproblemRecord(
-                subproblem.id,
-                status_name,
-                objective_value,
-                max(0.0, time.monotonic() - subproblem_started_at),
-            )
+        if deadline is not None and (
+            status == pulp.LpStatusNotSolved or _deadline_reached(deadline)
+        ):
+            raise _TimeLimitReached(subproblem.id)
+        raise SubproblemSolveError(
+            f"subproblem {subproblem.id} did not reach optimality: {status_name}"
         )
-        for index, variable in subproblem.variables.items():
-            value = variable.value()
-            if value is None:
-                value = _canonical_free_value(model, index)
-            if not math.isfinite(value):
-                raise SubproblemSolveError(
-                    f"subproblem {subproblem.id} returned no finite value for {variable.name!r}"
-                )
-            values[model.variables[index].name] = float(value)
-    return values, tuple(records), total_objective
+    objective_value = float(pulp.value(subproblem.problem.objective) or 0.0)
+    values: dict[str, float] = {}
+    for index, variable in subproblem.variables.items():
+        value = variable.value()
+        if value is None:
+            value = _canonical_free_value(model, index)
+        if not math.isfinite(value):
+            raise SubproblemSolveError(
+                f"subproblem {subproblem.id} returned no finite value for {variable.name!r}"
+            )
+        values[model.variables[index].name] = float(value)
+    return _SolvedSubproblem(
+        values=values,
+        record=SubproblemRecord(
+            subproblem.id,
+            status_name,
+            objective_value,
+            max(0.0, time.monotonic() - subproblem_started_at),
+        ),
+        objective_value=objective_value,
+    )
 
 
 def _remaining_time(deadline: float | None) -> float | None:

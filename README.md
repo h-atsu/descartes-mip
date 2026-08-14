@@ -3,8 +3,9 @@
 `descartes-mip` は、PuLPで記述したMILPから、利用者が指定したソフト制約を
 ラグランジュ緩和し、独立な部分問題を自動生成・求解するためのライブラリです。
 
-現在は段階的に開発中です。設計、数理的な契約、マイルストーンは
-[設計文書](docs/design.md)を参照してください。
+設計と数理的な契約は[設計文書](docs/design.md)、公開インターフェースの詳細は
+[APIリファレンス](docs/api.md)を参照してください。実行可能な一連の例は
+[チュートリアル](examples/tutorial.py)にあります。
 
 ## 現在利用できるAPI
 
@@ -34,7 +35,8 @@ for subproblem in decomposition.subproblems:
 `Decomposition` は診断用の不変データで、変数、ハード制約、目的係数、緩和制約の
 部分式を確認できます。
 
-分解した部分問題をHiGHSで逐次求解し、投影付きPolyak劣勾配法で乗数を更新できます。
+分解した部分問題をHiGHSで求解し、投影付きPolyak劣勾配法で乗数を更新できます。
+既定は逐次求解で、`parallel=True` を指定すると独立な部分問題を並列に求解します。
 
 ```python
 from descartes_mip import solve
@@ -44,6 +46,8 @@ result = solve(
     relax=[SoftConstraint(coupling, penalty=100.0)],
     max_iterations=100,
     time_limit=300.0,
+    parallel=True,
+    workers=2,
 )
 
 print(result.best_primal_bound)
@@ -71,6 +75,10 @@ v1では、`solve()` に渡すモデルの全決定変数に、有限な下限�
 部分問題は `result.timed_out_subproblem` で確認できます。最初の反復が未完了の場合、
 `result.has_certified_bounds` と `result.soft_feasible` はともに `False` です。
 
+並列求解でも部分問題ごとに新しいソルバーを生成し、結果と履歴は部分問題ID順に
+決定論的に集約します。独自のPuLPソルバーを利用する場合は、呼び出しごとに新しい
+インスタンスを返す `solver_factory(remaining_time)` を渡してください。
+
 ## 開発環境
 
 Python 3.12と[uv](https://docs.astral.sh/uv/)を使用します。
@@ -81,7 +89,7 @@ uv run pytest
 ```
 
 公式の検証用MILPソルバーはHiGHSです。モデリング層とソルバー接続にはPuLPを
-利用します。
+利用し、CBCについても基本的な互換テストを行っています。
 
 ## 開発状況
 
@@ -89,4 +97,4 @@ uv run pytest
 - [x] Milestone 2: PuLPモデルの解析と自動分解
 - [x] Milestone 3: ラグランジュ反復求解
 - [x] Milestone 4: 時間制御・結果・障害処理
-- [ ] Milestone 5: 並列求解と公開品質
+- [x] Milestone 5: 並列求解と公開品質
