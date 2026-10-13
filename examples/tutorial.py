@@ -1,28 +1,21 @@
-"""Complete example: decompose and solve a soft production target."""
+"""Build, decompose, and solve a soft production target."""
 
-import pulp
-
-from descartes_mip import SoftConstraint, decompose, solve
+from descartes_mip import Model, VariableType
 
 
 def main() -> None:
-    problem = pulp.LpProblem("production", pulp.LpMinimize)
-    plant_a = problem.add_variable("plant_a", lowBound=0, upBound=8, cat=pulp.LpInteger)
-    plant_b = problem.add_variable("plant_b", lowBound=0, upBound=8, cat=pulp.LpInteger)
+    model = Model("production")
+    plant_a = model.add_var("plant_a", lb=0, ub=8, vartype=VariableType.INTEGER)
+    plant_b = model.add_var("plant_b", lb=0, ub=8, vartype=VariableType.INTEGER)
+    model.minimize(3 * plant_a + 5 * plant_b)
+    demand = model.add_constraint(plant_a + plant_b >= 10, "demand")
+    model.relax(demand, penalty=20)
 
-    problem += 3 * plant_a + 5 * plant_b
-    demand = plant_a + plant_b >= 10
-    problem += demand, "demand"
-    relaxed = [SoftConstraint(demand, penalty=20)]
-
-    structure = decompose(problem, relax=relaxed)
+    structure = model.decompose()
     print("subproblems:", [part.variables for part in structure.subproblems])
 
-    result = solve(
-        problem,
-        relax=relaxed,
-        solver=pulp.HiGHS,
-        solver_options={"msg": False},
+    result = model.solve(
+        highs_options={"mip_rel_gap": 0.0},
         max_iterations=50,
         time_limit=30,
         parallel=True,
@@ -31,7 +24,9 @@ def main() -> None:
     print("termination:", result.termination_reason)
     print("certified bounds:", result.best_dual_bound, result.best_primal_bound)
     print("solution:", result.variable_values)
-    print("soft-constraint slacks:", result.slacks)
+    print("demand violation:", result.violation(demand))
+    print("plant A:", result.value(plant_a))
+    print("plant B:", result.value(plant_b))
 
 
 if __name__ == "__main__":

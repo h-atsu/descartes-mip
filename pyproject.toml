@@ -1,7 +1,7 @@
 [project]
 name = "descartes-mip"
-version = "0.1.0"
-description = "Automatic Lagrangian decomposition for PuLP models"
+version = "0.2.0"
+description = "Solver-independent modeling and automatic Lagrangian decomposition"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -14,7 +14,7 @@ keywords = [
     "mathematical-optimization",
     "milp",
     "operations-research",
-    "pulp",
+    "modeling",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -27,7 +27,6 @@ classifiers = [
 ]
 dependencies = [
     "highspy>=1.15.1",
-    "pulp>=3.3.2",
 ]
 
 [project.urls]
@@ -47,7 +46,7 @@ line-length = 100
 target-version = "py312"
 
 [build-system]
-requires = ["uv_build>=0.11.19,<0.12.0"]
+requires = ["uv_build>=0.11.19,<0.13.0"]
 build-backend = "uv_build"
 
 [dependency-groups]

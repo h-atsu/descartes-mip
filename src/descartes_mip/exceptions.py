@@ -6,7 +6,7 @@ class DescartesMipError(Exception):
 
 
 class ModelValidationError(DescartesMipError, ValueError):
-    """Raised when a PuLP model cannot be decomposed safely."""
+    """Raised when a model or solver option cannot be processed safely."""
 
 
 class SubproblemSolveError(DescartesMipError, RuntimeError):
