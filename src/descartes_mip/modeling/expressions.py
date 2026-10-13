@@ -228,10 +228,23 @@ def _as_expression(value: object) -> LinearExpr:
 def quicksum(values: Iterable[LinearOperand]) -> LinearExpr:
     """Return the linear sum of an iterable without creating a solver model."""
 
-    result = LinearExpr()
+    owner: Model | None = None
+    terms: dict[int, float] = {}
+    constant = 0.0
     for value in values:
-        result = result + value
-    return result
+        expression = _as_expression(value)
+        if owner is not None and expression._owner is not None and owner is not expression._owner:
+            raise ModelValidationError("cannot combine expressions from different models")
+        if owner is None:
+            owner = expression._owner
+        for index, coefficient in expression._terms.items():
+            updated = terms.get(index, 0.0) + coefficient
+            if updated == 0.0:
+                terms.pop(index, None)
+            else:
+                terms[index] = updated
+        constant += expression._constant
+    return LinearExpr(owner, terms, constant)
 
 
 def as_expression(value: LinearOperand) -> LinearExpr:

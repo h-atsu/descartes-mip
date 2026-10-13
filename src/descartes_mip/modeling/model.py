@@ -40,6 +40,8 @@ class Model:
         self._constraints: list[Constraint] = []
         self._variable_names: set[str] = set()
         self._constraint_names: set[str] = set()
+        self._next_variable_name_index = 0
+        self._next_constraint_name_index = 0
         self._objective = LinearExpr()
         self._sense = ObjectiveSense.MINIMIZE
         self._relaxations: dict[int, float] = {}
@@ -54,7 +56,12 @@ class Model:
     ) -> Variable:
         if not isinstance(vartype, VariableType):
             raise ModelValidationError("vartype must be a VariableType")
-        resolved_name = self._resolve_name(name, "var", self._variable_names)
+        resolved_name, next_name_index = self._resolve_name(
+            name,
+            "var",
+            self._variable_names,
+            self._next_variable_name_index,
+        )
         low_bound = self._bound(lb, resolved_name, "lower")
         up_bound = self._bound(ub, resolved_name, "upper")
         if vartype is VariableType.BINARY:
@@ -74,6 +81,7 @@ class Model:
         )
         self._variables.append(variable)
         self._variable_names.add(resolved_name)
+        self._next_variable_name_index = next_name_index
         return variable
 
     def add_constraint(self, constraint: Constraint, name: str | None = None) -> Constraint:
@@ -83,13 +91,19 @@ class Model:
             raise ModelValidationError("constraint has already been added to a model")
         if constraint._owner is not None and constraint._owner is not self:
             raise ModelValidationError("constraint belongs to another model")
-        resolved_name = self._resolve_name(name, "constraint", self._constraint_names)
+        resolved_name, next_name_index = self._resolve_name(
+            name,
+            "constraint",
+            self._constraint_names,
+            self._next_constraint_name_index,
+        )
         constraint._owner = self
         constraint._expression._owner = self
         constraint._index = len(self._constraints)
         constraint._name = resolved_name
         self._constraints.append(constraint)
         self._constraint_names.add(resolved_name)
+        self._next_constraint_name_index = next_name_index
         return constraint
 
     def minimize(self, expression: LinearOperand) -> None:
@@ -210,17 +224,22 @@ class Model:
         return model, relaxations
 
     @staticmethod
-    def _resolve_name(name: str | None, prefix: str, used: set[str]) -> str:
+    def _resolve_name(
+        name: str | None,
+        prefix: str,
+        used: set[str],
+        next_index: int,
+    ) -> tuple[str, int]:
         if name is not None:
             if not isinstance(name, str) or not name:
                 raise ModelValidationError("names must be non-empty strings when supplied")
             if name in used:
                 raise ModelValidationError(f"duplicate name {name!r}")
-            return name
-        index = 0
+            return name, next_index
+        index = next_index
         while f"{prefix}_{index}" in used:
             index += 1
-        return f"{prefix}_{index}"
+        return f"{prefix}_{index}", index + 1
 
     @staticmethod
     def _bound(value: float | None, variable_name: str, side: str) -> float | None:

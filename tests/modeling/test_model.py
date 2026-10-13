@@ -45,6 +45,29 @@ def test_quicksum_and_scalar_arithmetic_cancel_zero_terms() -> None:
     assert [(term.variable_index, term.coefficient) for term in ir.objective_terms] == [(1, 1.0)]
 
 
+def test_quicksum_matches_builtin_sum_for_repeated_terms_and_constants() -> None:
+    model = Model()
+    x = model.add_var(lb=0, ub=1)
+    y = model.add_var(lb=0, ub=1)
+    values = [x, 2 * y, 3 * x, -y, -4 * x, 2.5]
+
+    model.minimize(quicksum(value for value in values))
+    quicksum_ir, _ = model._snapshot()
+    model.minimize(sum(values, start=LinearExpr()))
+    builtin_sum_ir, _ = model._snapshot()
+
+    assert quicksum_ir.objective_constant == builtin_sum_ir.objective_constant
+    assert quicksum_ir.objective_terms == builtin_sum_ir.objective_terms
+
+
+def test_quicksum_rejects_expressions_from_different_models() -> None:
+    left = Model().add_var(lb=0, ub=1)
+    right = Model().add_var(lb=0, ub=1)
+
+    with pytest.raises(ModelValidationError, match="different models"):
+        quicksum([left, right])
+
+
 def test_binary_defaults_to_zero_one_and_accepts_fixed_binary() -> None:
     model = Model()
     default = model.add_var(vartype=VariableType.BINARY)
@@ -63,13 +86,36 @@ def test_invalid_binary_or_inconsistent_bounds_are_rejected(
         model.add_var(lb=bounds[0], ub=bounds[1], vartype=VariableType.BINARY)
 
 
-def test_explicit_and_generated_names_never_collide() -> None:
+def test_explicit_and_generated_variable_names_never_collide() -> None:
     model = Model()
     model.add_var("var_0", lb=0, ub=1)
-    generated = model.add_var(lb=0, ub=1)
-    assert generated.name == "var_1"
+    model.add_var("var_2", lb=0, ub=1)
+
+    generated = [model.add_var(lb=0, ub=1).name for _ in range(3)]
+
+    assert generated == ["var_1", "var_3", "var_4"]
     with pytest.raises(ModelValidationError, match="duplicate"):
         model.add_var("var_0")
+
+
+def test_explicit_and_generated_constraint_names_never_collide() -> None:
+    model = Model()
+    x = model.add_var(lb=0, ub=1)
+    model.add_constraint(x <= 1, "constraint_0")
+    model.add_constraint(x <= 1, "constraint_2")
+
+    generated = [model.add_constraint(x <= 1).name for _ in range(3)]
+
+    assert generated == ["constraint_1", "constraint_3", "constraint_4"]
+
+
+def test_failed_variable_validation_does_not_consume_generated_name() -> None:
+    model = Model()
+
+    with pytest.raises(ModelValidationError, match="inconsistent bounds"):
+        model.add_var(lb=1, ub=0)
+
+    assert model.add_var().name == "var_0"
 
 
 def test_cross_model_and_nonlinear_expressions_are_rejected() -> None:
