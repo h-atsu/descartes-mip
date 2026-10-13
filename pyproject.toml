@@ -1,6 +1,6 @@
 [project]
 name = "descartes-mip"
-version = "0.2.0"
+version = "0.2.1"
 description = "Solver-independent modeling and automatic Lagrangian decomposition"
 readme = "README.md"
 license = "MIT"
